@@ -5,6 +5,7 @@ import androidx.collection.arraySetOf
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.Interceptor
@@ -12,6 +13,7 @@ import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.HttpStatusException
+import java.net.ProtocolException
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -25,7 +27,7 @@ import org.koitharu.kotatsu.parsers.util.json.*
 import java.text.SimpleDateFormat
 import java.util.*
 
-@MangaSourceParser("NAVER_WEBTOON", "Naver Webtoon", "ko")
+@MangaSourceParser("NAVER_WEBTOON", "Naver Webtoon", "ko", type = ContentType.MANHWA)
 internal class NaverWebtoonParser(context: MangaLoaderContext) :
 	AbstractMangaParser(context, MangaParserSource.NAVER_WEBTOON) {
 
@@ -243,13 +245,16 @@ internal class NaverWebtoonParser(context: MangaLoaderContext) :
 			?.coerceAtLeast(1)
 			?: 1
 
-		val pageObjects = if (totalPages > 1) {
-			val remaining = (2..totalPages).map { page ->
-				async { fetchArticleListPage(titleId, page) }
-			}.awaitAll()
-			listOf(firstPage) + remaining
-		} else {
-			listOf(firstPage)
+		val pageObjects = ArrayList<JSONObject>(totalPages)
+		pageObjects.add(firstPage)
+		if (totalPages > 1) {
+			// Cap concurrent page requests to avoid Naver HTTP/1.1 keep-alive frame corruption
+			for (batch in (2..totalPages).chunked(CHAPTER_PAGE_BATCH_SIZE)) {
+				val remaining = batch.map { page ->
+					async { fetchArticleListPage(titleId, page) }
+				}.awaitAll()
+				pageObjects.addAll(remaining)
+			}
 		}
 
 		val chapters = ArrayList<MangaChapter>()
@@ -284,15 +289,27 @@ internal class NaverWebtoonParser(context: MangaLoaderContext) :
 	}
 
 	private suspend fun fetchArticleListPage(titleId: Long, page: Int): JSONObject {
-		val url = "https://$domain/api/article/list?titleId=$titleId&page=$page"
-		return try {
-			webClient.httpGet(url, apiHeaders()).parseJson()
-		} catch (e: HttpStatusException) {
-			if (e.statusCode == 401 || e.statusCode == 403) {
-				throw AuthRequiredException(source, e)
+		val url = "https://$domain/api/article/list?titleId=$titleId&page=$page&sort=ASC"
+		var lastError: ProtocolException? = null
+		for (attempt in 0 until 2) {
+			val headers = if (attempt == 0) {
+				apiHeaders()
+			} else {
+				apiHeaders().newBuilder().add("Connection", "close").build()
 			}
-			throw e
+			try {
+				return webClient.httpGet(url, headers).parseJson()
+			} catch (e: HttpStatusException) {
+				if (e.statusCode == 401 || e.statusCode == 403) {
+					throw AuthRequiredException(source, e)
+				}
+				throw e
+			} catch (e: ProtocolException) {
+				lastError = e
+				if (attempt == 0) delay(150)
+			}
 		}
+		throw checkNotNull(lastError)
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
@@ -478,6 +495,7 @@ internal class NaverWebtoonParser(context: MangaLoaderContext) :
 		const val GENRE_PAGE_SIZE = 25
 		const val FINISHED_PAGE_SIZE = 45
 		const val SEARCH_PAGE_SIZE = 10
+		const val CHAPTER_PAGE_BATCH_SIZE = 4
 
 		val WEEKDAY_KEYS = arrayOf(
 			"MONDAY",
