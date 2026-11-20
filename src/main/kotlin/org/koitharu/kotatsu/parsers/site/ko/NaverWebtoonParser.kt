@@ -13,7 +13,6 @@ import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.HttpStatusException
-import java.net.ProtocolException
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -24,6 +23,7 @@ import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.network.UserAgents
 import org.koitharu.kotatsu.parsers.util.*
 import org.koitharu.kotatsu.parsers.util.json.*
+import java.net.ProtocolException
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -33,6 +33,7 @@ internal class NaverWebtoonParser(context: MangaLoaderContext) :
 
 	override val configKeyDomain = ConfigKey.Domain("comic.naver.com")
 
+	// Mobile UAs redirect comic.naver.com to m.comic.naver.com, breaking domain validation and omitting PC-only titles.
 	override val userAgentKey = ConfigKey.UserAgent(UserAgents.CHROME_DESKTOP)
 
 	private val mobileDomain: String
@@ -50,6 +51,8 @@ internal class NaverWebtoonParser(context: MangaLoaderContext) :
 	override val filterCapabilities: MangaListFilterCapabilities
 		get() = MangaListFilterCapabilities(
 			isSearchSupported = true,
+			// Kotatsu only forwards filter.tags to getList when this flag is enabled;
+			// the backend accepts one genre per request, so getList uses the first selected tag.
 			isMultipleTagsSupported = true,
 		)
 
@@ -74,7 +77,7 @@ internal class NaverWebtoonParser(context: MangaLoaderContext) :
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
 		availableTags = genreTags,
-		availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED),
+		availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED, MangaState.PAUSED),
 		availableContentRating = EnumSet.of(ContentRating.SAFE, ContentRating.ADULT),
 	)
 
@@ -117,56 +120,52 @@ internal class NaverWebtoonParser(context: MangaLoaderContext) :
 	override suspend fun getList(offset: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
 		val query = filter.query?.trim().orEmpty()
 		if (query.isNotEmpty()) {
-			return fetchSearchList(offset, query)
+			return fetchPagedList(offset, SEARCH_PAGE_SIZE, "searchList") { page ->
+				"https://$domain/api/search/webtoon?keyword=${query.urlEncoded()}&page=$page"
+			}
 		}
 		if (filter.tags.isNotEmpty()) {
-			return fetchGenreList(offset, order, filter.tags.first())
+			val genreTag = genreTagsByKey[filter.tags.first().key] ?: return emptyList()
+			val sortParam = mapSortOrder(order)
+			return fetchPagedList(offset, GENRE_PAGE_SIZE, "titleList", defaultTag = genreTag) { page ->
+				"https://$domain/api/webtoon/titlelist/genre?genre=${genreTag.key}&page=$page&order=$sortParam"
+			}
 		}
-		val finishedOnly = MangaState.FINISHED in filter.states && MangaState.ONGOING !in filter.states
+		val finishedOnly = MangaState.FINISHED in filter.states &&
+			MangaState.ONGOING !in filter.states &&
+			MangaState.PAUSED !in filter.states
 		if (finishedOnly) {
-			return fetchFinishedList(offset, order)
+			val sortParam = mapSortOrder(order)
+			return fetchPagedList(offset, FINISHED_PAGE_SIZE, "titleList", defaultFinished = true) { page ->
+				"https://$domain/api/webtoon/titlelist/finished?page=$page&order=$sortParam"
+			}
 		}
-		return fetchWeekdayList(offset, order, filter.contentRating)
+		return fetchWeekdayList(offset, order, filter)
 	}
 
-	private suspend fun fetchSearchList(offset: Int, query: String): List<Manga> {
-		val page = (offset / SEARCH_PAGE_SIZE) + 1
-		val sliceStart = offset % SEARCH_PAGE_SIZE
-		val url = "https://$domain/api/search/webtoon?keyword=${query.urlEncoded()}&page=$page"
-		val json = webClient.httpGet(url, apiHeaders()).parseJson()
+	private suspend inline fun fetchPagedList(
+		offset: Int,
+		pageSize: Int,
+		arrayKey: String,
+		defaultTag: MangaTag? = null,
+		defaultFinished: Boolean = false,
+		urlForPage: (Int) -> String,
+	): List<Manga> {
+		val page = (offset / pageSize) + 1
+		val sliceStart = offset % pageSize
+		val json = webClient.httpGet(urlForPage(page), apiHeaders()).parseJson()
 		if (isPastTotalPages(json, page)) return emptyList()
-		val array = json.optJSONArray("searchList") ?: return emptyList()
-		val items = array.mapJSONNotNull { parseMangaSummary(it) }
-		return if (sliceStart == 0) items else items.drop(sliceStart)
-	}
-
-	private suspend fun fetchGenreList(offset: Int, order: SortOrder, tag: MangaTag): List<Manga> {
-		val genreTag = genreTagsByKey[tag.key] ?: return emptyList()
-		val page = (offset / GENRE_PAGE_SIZE) + 1
-		val sliceStart = offset % GENRE_PAGE_SIZE
-		val url = "https://$domain/api/webtoon/titlelist/genre?genre=${genreTag.key}&page=$page&order=${mapSortOrder(order)}"
-		val json = webClient.httpGet(url, apiHeaders()).parseJson()
-		if (isPastTotalPages(json, page)) return emptyList()
-		val array = json.optJSONArray("titleList") ?: return emptyList()
-		val items = array.mapJSONNotNull { parseMangaSummary(it, defaultTag = genreTag) }
-		return if (sliceStart == 0) items else items.drop(sliceStart)
-	}
-
-	private suspend fun fetchFinishedList(offset: Int, order: SortOrder): List<Manga> {
-		val page = (offset / FINISHED_PAGE_SIZE) + 1
-		val sliceStart = offset % FINISHED_PAGE_SIZE
-		val url = "https://$domain/api/webtoon/titlelist/finished?page=$page&order=${mapSortOrder(order)}"
-		val json = webClient.httpGet(url, apiHeaders()).parseJson()
-		if (isPastTotalPages(json, page)) return emptyList()
-		val array = json.optJSONArray("titleList") ?: return emptyList()
-		val items = array.mapJSONNotNull { parseMangaSummary(it, defaultFinished = true) }
+		val array = json.optJSONArray(arrayKey) ?: return emptyList()
+		val items = array.mapJSONNotNull {
+			parseMangaSummary(it, defaultTag = defaultTag, defaultFinished = defaultFinished)
+		}
 		return if (sliceStart == 0) items else items.drop(sliceStart)
 	}
 
 	private suspend fun fetchWeekdayList(
 		offset: Int,
 		order: SortOrder,
-		contentRatingFilter: Set<ContentRating>,
+		filter: MangaListFilter,
 	): List<Manga> {
 		val url = "https://$domain/api/webtoon/titlelist/weekday?order=${mapSortOrder(order)}"
 		val json = webClient.httpGet(url, apiHeaders()).parseJson()
@@ -184,7 +183,9 @@ internal class NaverWebtoonParser(context: MangaLoaderContext) :
 				val titleId = jo.optLong("titleId", -1L)
 				if (titleId <= 0L || !seenIds.add(titleId)) continue
 				val manga = parseMangaSummary(jo) ?: continue
-				if (contentRatingFilter.isEmpty() || manga.contentRating in contentRatingFilter) {
+				val matchesRating = filter.contentRating.isEmpty() || manga.contentRating in filter.contentRating
+				val matchesState = filter.states.isEmpty() || manga.state in filter.states
+				if (matchesRating && matchesState) {
 					combined.add(manga)
 				}
 			}
@@ -248,7 +249,7 @@ internal class NaverWebtoonParser(context: MangaLoaderContext) :
 		val pageObjects = ArrayList<JSONObject>(totalPages)
 		pageObjects.add(firstPage)
 		if (totalPages > 1) {
-			// Cap concurrent page requests to avoid Naver HTTP/1.1 keep-alive frame corruption
+			// Cap concurrent page requests to avoid Naver HTTP/1.1 keep-alive frame corruption.
 			for (batch in (2..totalPages).chunked(CHAPTER_PAGE_BATCH_SIZE)) {
 				val remaining = batch.map { page ->
 					async { fetchArticleListPage(titleId, page) }
@@ -263,7 +264,7 @@ internal class NaverWebtoonParser(context: MangaLoaderContext) :
 			val articles = pageJson.optJSONArray("articleList") ?: continue
 			for (i in 0 until articles.length()) {
 				val jo = articles.optJSONObject(i) ?: continue
-				// Paid DailyPass episodes return a JS redirect alert instead of viewer images
+				// Paid DailyPass episodes redirect to a browser alert instead of viewer images.
 				if (jo.getBooleanOrDefault("charge", false)) continue
 				val no = jo.getIntOrDefault("no", 0)
 				if (no <= 0) continue
@@ -319,10 +320,21 @@ internal class NaverWebtoonParser(context: MangaLoaderContext) :
 		if (titleId == null || no == null) {
 			throw ParseException("Invalid chapter url: ${chapter.url}", chapter.url)
 		}
-		val viewerUrl = "https://$mobileDomain/webtoon/detail?titleId=$titleId&no=$no"
-		val doc = webClient.httpGet(viewerUrl, getRequestHeaders()).parseHtml()
-		val elements = doc.select("img.toon_image").ifEmpty {
-			doc.select("img[data-src*=mobilewebimg], img[src*=mobilewebimg]")
+		val viewerUrl = "https://$domain/webtoon/detail?titleId=$titleId&no=$no"
+		val response = webClient.httpGet(viewerUrl, getRequestHeaders())
+		val finalUrl = response.request.url
+		if (finalUrl.host.equals(LOGIN_HOST, ignoreCase = true)) {
+			response.close()
+			throw AuthRequiredException(source)
+		}
+		if (finalUrl.encodedPath == "/webtoon/list") {
+			response.close()
+			throw ParseException("Paid or locked episode", viewerUrl)
+		}
+
+		val doc = response.parseHtml()
+		val elements = doc.select("div.wt_viewer img[id^=content_image_]").ifEmpty {
+			doc.select("div.wt_viewer img[alt=comic content]")
 		}
 		val pages = elements.mapIndexedNotNull { index, img ->
 			val rawUrl = img.attr("data-src").ifBlank { img.attr("src") }.trim()
@@ -490,6 +502,7 @@ internal class NaverWebtoonParser(context: MangaLoaderContext) :
 
 	private companion object {
 		const val IMAGE_DOMAIN = "image-comic.pstatic.net"
+		const val LOGIN_HOST = "nid.naver.com"
 		const val FAVICON_URL = "https://shared-comic.pstatic.net/favicon/favicon_96x96.ico"
 		const val AGE_RATE_18 = "RATE_18"
 		const val GENRE_PAGE_SIZE = 25
